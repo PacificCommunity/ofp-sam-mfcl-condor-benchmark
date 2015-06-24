@@ -64,7 +64,7 @@ public final class Main {
             });
         }
         // Create workdir.
-        message("Initializint workspace.");
+        message("Initializing workspace.");
         Files.createDirectory(workPath);
         // Prepare host work spaces.
         final String hostsValue = settings.getProperty("hosts"); // NOI18N.
