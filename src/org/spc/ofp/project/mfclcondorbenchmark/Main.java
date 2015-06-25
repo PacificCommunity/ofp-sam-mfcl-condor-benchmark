@@ -26,6 +26,9 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Properties;
+import java.util.logging.Level;
+import java.util.logging.Logger;
+import java.util.stream.IntStream;
 
 /**
  *
@@ -33,103 +36,165 @@ import java.util.Properties;
  */
 public final class Main {
 
-    /**
-     * @param args the command line arguments
-     */
-    public static void main(String[] args) throws IOException {
-        message("Reading settings.");
-        final Path settingsPath = new File("settings.properties").toPath(); // NOI18N.
-        final Properties settings = new Properties();
-        try (final InputStream input = Files.newInputStream(settingsPath)) {
-            settings.load(input);
-        }
-        // Work space.
-        final String wordDir = settings.getProperty("work.dir"); // NOI18N.
-        final Path workPath = new File(wordDir).toPath();
-        // Delete workdir if exists.
-        if (Files.exists(workPath)) {
-            message("Cleaning previous workspace.");
-            Files.walkFileTree(workPath, new SimpleFileVisitor<Path>() {
-                @Override
-                public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
-                    Files.delete(file);
-                    return FileVisitResult.CONTINUE;
-                }
+    private final List<Exception> raisedExceptions = new ArrayList<>();
+    private final Properties settings = new Properties();
+    private final String wordDir;
+    private final Path workPath;
+    private final String templateSource;
+    private final Path templateSourcePath;
+    private final List<Path> workDirPathList = new ArrayList<>();
 
-                @Override
-                public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
-                    Files.delete(dir);
-                    return FileVisitResult.CONTINUE;
-                }
-            });
+    /**
+     * Creates a new instance.
+     * @throws IOException In case of IO error.
+     */
+    public Main() throws IOException {
+        ////////////////////////////////////////////////////////////////////////
+        // Read settings.
+        readSettings();
+        ////////////////////////////////////////////////////////////////////////
+        // Check if template dir exists.
+        templateSource = settings.getProperty("template.source"); // NOI18N.
+        templateSourcePath = new File(templateSource).toPath();
+        if (!Files.exists(templateSourcePath)) {
+            throw new IOException();
         }
-        // Create workdir.
-        message("Initializing workspace.");
-        Files.createDirectory(workPath);
-        // Prepare host work spaces.
+        ////////////////////////////////////////////////////////////////////////
+        // Initialize work space.
+        wordDir = settings.getProperty("work.dir"); // NOI18N.
+        workPath = new File(wordDir).toPath();
+        initializeWorkspace();
+        ////////////////////////////////////////////////////////////////////////
+        // Prepare host work spaces in parallel.
+        final int testNumber = Integer.parseInt(settings.getProperty("test.number")); // NOI18N.
         final String hostsValue = settings.getProperty("hosts"); // NOI18N.
         final String[] hosts = hostsValue.split(",\\s*"); // NOI18N.
-        final List<Exception> exceptions = new ArrayList<>();
         Arrays.stream(hosts)
                 .parallel()
                 .forEach(host -> {
                     try {
-                        message(String.format("Setting up workspace for host \"%s\".", host));
-                        setupWorkDirForHost(settings, host);
+                        message(String.format("Setting up workspace for host \"%s\".", host)); // NOI18N.
+                        setupWorkDirsForHost(host, testNumber);
                     } catch (Exception ex) {
-                        exceptions.add(ex);
-                    }
-                });
-        // Launch in parallel.
-        Arrays.stream(hosts)
-                .parallel()
-                .forEach(host -> {
-                    try {
-                        message(String.format("Launching job for host \"%s\".", host));
-                        launchJobForHost(settings, host);
-                        message(String.format("Job for host \"%s\" finished.", host));
-                    } catch (Exception ex) {
-                        exceptions.add(ex);
-                    }
-                });
-        // Extract results.
-        Arrays.stream(hosts)
-                .forEach(host -> {
-                    try {
-                        message(String.format("Getting result for host \"%s\".", host));
-                        processResultForHost(settings, host);
-                    } catch (Exception ex) {
-                        exceptions.add(ex);
+                        raisedExceptions.add(ex);
                     }
                 });
         ////////////////////////////////////////////////////////////////////////
-        if (!exceptions.isEmpty()) {
+        // Launch in parallel.
+        if (workDirPathList.isEmpty()) {
             final IOException ex = new IOException();
-            exceptions.stream()
+            raisedExceptions.stream()
+                    .forEach(suppressed -> ex.addSuppressed(suppressed));
+            throw ex;
+        }
+        workDirPathList.stream()
+                .parallel()
+                .forEach(workDirPath -> {
+                    try {
+                        message(String.format("Launching job \"%s\".", workDirPath.toString())); // NOI18N.
+                        launchJob(workDirPath);
+                        message(String.format("Job \"%s\" finished.", workDirPath.toString())); // NOI18N.
+                    } catch (Exception ex) {
+                        raisedExceptions.add(ex);
+                    }
+                });
+        ////////////////////////////////////////////////////////////////////////
+        // Extract results sequentially.
+        message("Getting results."); // NOI18N.
+        workDirPathList.stream()
+                .forEach(workDirPath -> {
+                    try {
+                        processResults(workDirPath);
+                    } catch (Exception ex) {
+                        raisedExceptions.add(ex);
+                    }
+                });
+        ////////////////////////////////////////////////////////////////////////
+        if (!raisedExceptions.isEmpty()) {
+            final IOException ex = new IOException();
+            raisedExceptions.stream()
                     .forEach(suppressed -> ex.addSuppressed(suppressed));
             throw ex;
         }
     }
-    
-    private static synchronized void message(final String message){
-        System.out.println(message);
+
+    /**
+     * Read the settings file.
+     * @throws IOException In case of IO error.
+     */
+    private void readSettings() throws IOException {
+        message("Reading settings."); // NOI18N.
+        final Path settingsPath = new File("settings.properties").toPath(); // NOI18N.
+        if (!Files.exists(settingsPath)) {
+            throw new IOException();
+        }
+        try (final InputStream input = Files.newInputStream(settingsPath)) {
+            settings.load(input);
+        }
     }
 
-    private static void setupWorkDirForHost(final Properties settings, final String host) throws IOException {
-        final String templateSource = settings.getProperty("template.source");
-        final Path templateSourcePath = new File(templateSource).toPath();
+    /**
+     * Initialize workspace.
+     * <br/>Previous workspace will be cleared if it exists.
+     * @throws IOException In case of IO error.
+     */
+    private void initializeWorkspace() throws IOException {
+        // Delete workdir if exists.
+        if (!Files.exists(workPath)) {
+            message("Cleaning previous workspace."); // NOI18N.
+            clearDirectory(workPath);
+        }
+        // Create workdir.
+        message("Initializing workspace.");
+        Files.createDirectory(workPath);
+    }
+
+    /**
+     * Setup the work directories for given host.
+     * @param host The host.
+     * @param testNumber The number of tests.
+     * @throws IOException In case of IO error.
+     */
+    private void setupWorkDirsForHost(final String host, final int testNumber) throws IOException {
         if (!Files.exists(templateSourcePath)) {
             throw new IOException();
         }
-        //
-        final String wordDir = settings.getProperty("work.dir"); // NOI18N.
-        final Path workPath = new File(wordDir).toPath();
+        // Create host dir.
         final Path hostWorkPath = new File(workPath.toFile(), host).toPath();
         Files.createDirectory(hostWorkPath);
+        final List<Exception> hostSetupException = new ArrayList<>();
+        IntStream.range(0, testNumber)
+                .parallel()
+                .forEach(runIndex -> {
+                    try {
+                        setupWorkDirForHost(host, runIndex, hostWorkPath);
+                    } catch (IOException ex) {
+                        hostSetupException.add(ex);
+                    }
+                });
+        if (!hostSetupException.isEmpty()) {
+            final IOException ex = new IOException();
+            hostSetupException.stream()
+                    .forEach(suppressed -> ex.addSuppressed(ex));
+            throw ex;
+        }
+    }
+
+    /**
+     * Setup a work directories for given host.
+     * @param host The host.
+     * @param runIndex The test number.
+     * @param hostWorkPath The host work dir.
+     * @throws IOException In case of IO error.
+     */
+    private void setupWorkDirForHost(final String host, final int runIndex, final Path hostWorkPath) throws IOException {
+        // Create run dir.
+        final Path runWorkPath = new File(hostWorkPath.toFile(), String.valueOf(runIndex)).toPath();
+        Files.createDirectory(runWorkPath);
         final String subFile = settings.getProperty("sub.file"); // NOI18N.
-        final Path subFilePath = new File(hostWorkPath.toFile(), subFile).toPath();
+        // Create sub file.
+        final Path subFilePath = new File(runWorkPath.toFile(), subFile).toPath();
         Files.createFile(subFilePath);
-        // Sub file.
         try (final PrintWriter writer = new PrintWriter(Files.newOutputStream(subFilePath))) {
             final String universe = settings.getProperty("universe"); // NOI18N.
             writer.printf("universe = %s", universe).println(); // NOI18N.
@@ -145,7 +210,7 @@ public final class Main {
             writer.printf("output = %s", outFile).println(); // NOI18N.
             final String shouldTransferFiles = settings.getProperty("should.transfer.files"); // NOI18N.
             writer.printf("should_transfer_files = %s", shouldTransferFiles).println(); // NOI18N.
-            final String requirements = buildRequirements(settings, host);
+            final String requirements = buildRequirements(host);
             writer.printf("Requirements = %s", requirements).println(); // NOI18N.
             final String whenToTransferOutput = settings.getProperty("when.to.transfer.output"); // NOI18N.
             writer.printf("when_to_transfer_output = %s", whenToTransferOutput).println(); // NOI18N.
@@ -155,64 +220,70 @@ public final class Main {
             writer.printf("TRANSFER_INPUT_FILES = %s", tranferInputFiles).println(); // NOI18N.
             writer.println("queue"); // NOI18N.
         }
+        // Recopy exec file.
         final String execFile = settings.getProperty("exec.file"); // NOI18N.
-        recopyFromTemplate(templateSourcePath, hostWorkPath, execFile); // NOI18N.
+        recopyFromDirectory(templateSourcePath, runWorkPath, execFile); // NOI18N.
+        // Recopy input files.
         final String tranferInputFiles = settings.getProperty("tranfer.input.files"); // NOI18N.
         final String[] filesToTransfer = tranferInputFiles.split(",\\s*"); // NOI18N.
         for (final String fileToTransfer : filesToTransfer) {
-            recopyFromTemplate(templateSourcePath, hostWorkPath, fileToTransfer);
+            recopyFromDirectory(templateSourcePath, runWorkPath, fileToTransfer);
         }
+        // Valid directories are added to the run list.
+        workDirPathList.add(runWorkPath);
     }
 
-    private static void recopyFromTemplate(final Path sourcePath, final Path destinationPath, final String file) throws IOException {
-        final Path sourceFilePath = new File(sourcePath.toFile(), file).toPath();
-        final Path destinationFilePath = new File(destinationPath.toFile(), file).toPath();
-        Files.copy(sourceFilePath, destinationFilePath);
-    }
-
-    private static String buildRequirements(final Properties settings, final String host) {
+    /**
+     * Build run requirements string for given host.
+     * @param host The host.
+     * @return A {@code String}, never {@code null}.
+     */
+    private String buildRequirements(final String host) {
         final StringWriter result = new StringWriter();
         boolean isEmpty = true;
         try (final PrintWriter out = new PrintWriter(result)) {
             // Op sys.
             final String opsys = settings.getProperty("requirements.opsys"); // NOI18N.
             if (opsys != null && !opsys.trim().isEmpty()) {
-                out.printf("(OpSys == \"%s\")", opsys);
+                out.printf("(OpSys == \"%s\")", opsys); // NOI18N.
                 isEmpty = false;
             }
             // Arch.
             final String arch = settings.getProperty("requirements.arch"); // NOI18N.
             if (arch != null && !arch.trim().isEmpty()) {
                 if (!isEmpty) {
-                    out.print(" && ");
+                    out.print(" && "); // NOI18N.
                 }
-                out.printf("(arch == \"%s\")", arch);
+                out.printf("(arch == \"%s\")", arch); // NOI18N.
                 isEmpty = false;
             }
             // Min memory.
             final String minMemory = settings.getProperty("requirements.min.memory"); // NOI18N.
             if (minMemory != null && !minMemory.trim().isEmpty()) {
                 if (!isEmpty) {
-                    out.print(" && ");
+                    out.print(" && "); // NOI18N.
                 }
-                out.printf("(memory > %s)", minMemory);
+                out.printf("(memory > %s)", minMemory); // NOI18N.
                 isEmpty = false;
             }
             // Host
             {
                 if (!isEmpty) {
-                    out.print(" && ");
+                    out.print(" && "); // NOI18N.
                 }
-                out.printf("(machine == \"%s\")", host);
+                out.printf("(machine == \"%s\")", host); // NOI18N.
             }
         }
         return result.toString();
     }
 
-    private static void launchJobForHost(final Properties settings, final String host) throws IOException, InterruptedException {
-        final String wordDir = settings.getProperty("work.dir"); // NOI18N.
-        final Path workPath = new File(wordDir).toPath();
-        final Path hostWorkPath = new File(workPath.toFile(), host).toPath();
+    /**
+    * Launch job in given work dir.
+    * @param hostWorkPath The work dir.
+    * @throws IOException In case of IO error.
+    * @throws InterruptedException If the report file monitoring was interrupted.
+    */
+    private void launchJob(final Path hostWorkPath) throws IOException, InterruptedException {
         final String condorBin = settings.getProperty("condor.bin"); // NOI18N.
         final String condorSubmit = settings.getProperty("condor.submit"); // NOI18N.
         final Path condorBinPath = new File(condorBin).toPath();
@@ -222,6 +293,7 @@ public final class Main {
         final String execExtension = System.getProperty("os.name").toLowerCase().contains("windows") ? ".exe" : ""; // NOI18N.
         final String command = String.format("%s/%s", condorBin, condorSubmit, execExtension); // NOI18N.
         final String subFile = settings.getProperty("sub.file"); // NOI18N.
+        // Submit job.
         final ProcessBuilder processBuilder = new ProcessBuilder(command, subFile);
         processBuilder.redirectOutput(ProcessBuilder.Redirect.INHERIT);
         processBuilder.redirectError(ProcessBuilder.Redirect.INHERIT);
@@ -231,12 +303,15 @@ public final class Main {
         if (exitValue != 0) {
             throw new IOException();
         }
+        // Monitor the log file to known when job is finished.
         final String logFile = settings.getProperty("log.file"); // NOI18N.
         final Path logFilePath = new File(hostWorkPath.toFile(), logFile).toPath();
         try (final WatchService watchService = FileSystems.getDefault().newWatchService()) {
             final WatchKey watchKey = hostWorkPath.register(watchService, StandardWatchEventKinds.ENTRY_MODIFY);
             boolean jobEnded = false;
+            // This will loop until the job is finished or has been canceled.
             while (!jobEnded) {
+                // Blocking method.
                 final WatchKey wk = watchService.take();
                 for (final WatchEvent<?> event : wk.pollEvents()) {
                     // We only registered "ENTRY_MODIFY" so the context is always a Path.
@@ -244,7 +319,7 @@ public final class Main {
                     if (changed.endsWith(logFile)) {
                         try (final LineNumberReader reader = new LineNumberReader(new FileReader(logFilePath.toFile()))) {
                             for (String line = reader.readLine(); line != null; line = reader.readLine()) {
-                                if (line.contains("Job terminated.") || line.contains("Job was aborted by the user")) {
+                                if (line.contains("Job terminated.") || line.contains("Job was aborted by the user")) { // NOI18N.
                                     jobEnded = true;
                                     break;
                                 }
@@ -252,24 +327,26 @@ public final class Main {
                         }
                     }
                 }
-                // reset the key
-                boolean valid = wk.reset();
+                // Reset the key
+                final boolean valid = wk.reset();
                 if (!valid) {
-                    message(String.format("%s: key has been unregisterede", host));
+                    message(String.format("%s: key has been unregistered", hostWorkPath.toString())); // NOI18N.
                 }
             }
         }
     }
 
-    private static void processResultForHost(final Properties settings, final String host) throws IOException {
-        final String wordDir = settings.getProperty("work.dir"); // NOI18N.
-        final Path workPath = new File(wordDir).toPath();
-        final Path hostWorkPath = new File(workPath.toFile(), host).toPath();
+    /**
+     * Process result file in given directory.
+     * @param hostWorkPath The working directory.
+     * @throws IOException In case of IO error.
+     */
+    private void processResults(final Path hostWorkPath) throws IOException {
         final String reportFile = settings.getProperty("report.file"); // NOI18N.
         final Path reportFilePath = new File(hostWorkPath.toFile(), reportFile).toPath();
         // Canceled jobs do not have a report.
         if (!Files.exists(reportFilePath)) {
-            message(String.format("%s: no result.", host));
+            message(String.format("%s: no result.", hostWorkPath.toString())); // NOI18N.
             return;
         }
         try (final LineNumberReader reader = new LineNumberReader(new FileReader(reportFilePath.toFile()))) {
@@ -283,7 +360,79 @@ public final class Main {
             final long finalSize = Long.parseLong(line.split("\\s+")[0]); // NOI18N.
             line = reader.readLine();
             final String execRunTime = line.substring(line.indexOf(':') + 1, line.length()).trim(); // NOI18N.
-            message(String.format("%s: %s -> %s, %s, %s", hostname, initialSize, finalSize, modelRunTime, execRunTime));
+            message(String.format("%s\t%s\t%s\t%s\t%s", hostname, initialSize, finalSize, modelRunTime, execRunTime)); // NOI18N.
+        } catch (IndexOutOfBoundsException | NumberFormatException ex) {
+            final String message = String.format("Error while parsing \"%s\".", reportFilePath.toString()); // NOI18N.
+            final IOException ioex = new IOException(message);
+            ioex.addSuppressed(ex);
+            throw ioex;
         }
+    }
+
+    ////////////////////////////////////////////////////////////////////////////
+    /**
+     * Program entry point.
+     * @param args The command line arguments
+     */
+    public static void main(String[] args) {
+        try {
+            final Main main = new Main();
+            System.exit(0);
+        } catch (IOException ex) {
+            Logger.getLogger(Main.class.getName()).log(Level.SEVERE, null, ex);
+            System.exit(1);
+        }
+    }
+
+    /**
+     * Clear given directory structure.
+     * @param directory The directory to clear.
+     * @throws IOException In case of IO error.
+     */
+    private static void clearDirectory(final Path directory) throws IOException {
+        if (!Files.exists(directory)) {
+            return;
+        }
+        Files.walkFileTree(directory, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                Files.delete(file);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                Files.delete(dir);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+    }
+
+    /**
+     * Recopy a file from a source directory to a destination directory.
+     * @param sourcePath Path to the source directory.
+     * @param destinationPath Path to the target directory.
+     * @param file The name of the file.
+     * @throws IOException In case of IO error.
+     */
+    private static void recopyFromDirectory(final Path sourcePath, final Path destinationPath, final String file) throws IOException {
+        if (!Files.exists(sourcePath) || !Files.isReadable(sourcePath)) {
+            throw new IOException();
+        }
+        if (Files.exists(destinationPath) && !Files.isWritable(destinationPath)) {
+            throw new IOException();
+        }
+        final Path sourceFilePath = new File(sourcePath.toFile(), file).toPath();
+        final Path destinationFilePath = new File(destinationPath.toFile(), file).toPath();
+        Files.copy(sourceFilePath, destinationFilePath);
+    }
+
+    /**
+     * Synchronized output method.
+     * <br/>As job processing is done in parallel, we need to synchronize console output.
+     * @param message The message to print to the output.
+     */
+    private static synchronized void message(final String message) {
+        System.out.println(message);
     }
 }
