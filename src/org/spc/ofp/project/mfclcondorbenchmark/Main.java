@@ -140,7 +140,7 @@ public final class Main {
      */
     private void initializeWorkspace() throws IOException {
         // Delete workdir if exists.
-        if (!Files.exists(workPath)) {
+        if (Files.exists(workPath)) {
             message("Cleaning previous workspace."); // NOI18N.
             clearDirectory(workPath);
         }
@@ -278,11 +278,11 @@ public final class Main {
     }
 
     /**
-    * Launch job in given work dir.
-    * @param hostWorkPath The work dir.
-    * @throws IOException In case of IO error.
-    * @throws InterruptedException If the report file monitoring was interrupted.
-    */
+     * Launch job in given work dir.
+     * @param hostWorkPath The work dir.
+     * @throws IOException In case of IO error.
+     * @throws InterruptedException If the report file monitoring was interrupted.
+     */
     private void launchJob(final Path hostWorkPath) throws IOException, InterruptedException {
         final String condorBin = settings.getProperty("condor.bin"); // NOI18N.
         final String condorSubmit = settings.getProperty("condor.submit"); // NOI18N.
@@ -394,6 +394,8 @@ public final class Main {
             return;
         }
         Files.walkFileTree(directory, new SimpleFileVisitor<Path>() {
+            
+            
             @Override
             public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
                 Files.delete(file);
